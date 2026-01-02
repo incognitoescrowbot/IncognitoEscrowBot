@@ -52,10 +52,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Conversation states
-SELECTING_CRYPTO, ENTERING_AMOUNT, ENTERING_RECIPIENT, CONFIRMING_TRANSACTION = range(4)
-DISPUTE_REASON, DISPUTE_EVIDENCE = range(4, 6)
-SELECTING_WALLET_TYPE, SELECTING_ADDRESS_TYPE, ENTERING_M, ENTERING_N, ENTERING_PUBLIC_KEYS, CONFIRMING_WALLET = range(6, 12)
-SELECTING_WITHDRAW_WALLET, ENTERING_WITHDRAW_AMOUNT, ENTERING_WALLET_ADDRESS = range(12, 15)
+SELECTING_ROLE, SELECTING_CRYPTO, ENTERING_AMOUNT, ENTERING_RECIPIENT, CONFIRMING_TRANSACTION = range(5)
+DISPUTE_REASON, DISPUTE_EVIDENCE = range(5, 7)
+SELECTING_WALLET_TYPE, SELECTING_ADDRESS_TYPE, ENTERING_M, ENTERING_N, ENTERING_PUBLIC_KEYS, CONFIRMING_WALLET = range(7, 13)
+SELECTING_WITHDRAW_WALLET, ENTERING_WITHDRAW_AMOUNT, ENTERING_WALLET_ADDRESS = range(13, 16)
 
 # Global variables
 app = None
@@ -307,6 +307,20 @@ def setup_database():
                            )
                        ''')
 
+        # Stats table for counters
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS stats
+                       (
+                           stat_key TEXT PRIMARY KEY,
+                           stat_value INTEGER DEFAULT 0,
+                           last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                       )
+                       ''')
+        
+        # Initialize stats if they don't exist
+        cursor.execute("INSERT OR IGNORE INTO stats (stat_key, stat_value) VALUES ('deals_completed', 0)")
+        cursor.execute("INSERT OR IGNORE INTO stats (stat_key, stat_value) VALUES ('disputes_resolved', 0)")
+
         conn.commit()
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -389,6 +403,45 @@ def get_or_create_user(user_id, username, first_name, last_name, language_code='
         if conn:
             conn.close()
     return user
+
+
+def get_stat(stat_key):
+    """Get a stat value from the database."""
+    conn = None
+    value = 0
+    try:
+        conn = sqlite3.connect('escrow_bot.db', timeout=20.0)
+        cursor = conn.cursor()
+        cursor.execute('SELECT stat_value FROM stats WHERE stat_key = ?', (stat_key,))
+        result = cursor.fetchone()
+        if result:
+            value = result[0]
+    except sqlite3.Error as e:
+        print(f"Database error in get_stat: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return value
+
+
+def increment_stat(stat_key):
+    """Increment a stat value in the database."""
+    conn = None
+    try:
+        conn = sqlite3.connect('escrow_bot.db', timeout=20.0)
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE stats SET stat_value = stat_value + 1, last_updated = CURRENT_TIMESTAMP WHERE stat_key = ?',
+            (stat_key,)
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error in increment_stat: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
 
 
 def process_pending_recipient(user_id, username):
@@ -777,9 +830,6 @@ def subtract_wallet_balance(wallet_id, amount):
 
         old_balance = result[0]
         new_balance = old_balance - amount
-
-        if new_balance < 0:
-            return {'success': False, 'error': f'Insufficient balance. Required: {amount}, Available: {old_balance}'}
 
         cursor.execute(
             'UPDATE wallets SET balance = ? WHERE wallet_id = ?',
@@ -1279,10 +1329,15 @@ async def start(update: Update, context: CallbackContext) -> None:
             f"Check /transactions to view them."
         )
 
+    deals_completed = get_stat('deals_completed')
+    disputes_resolved = get_stat('disputes_resolved')
+    
     welcome_message = (
         f"Welcome to the Incognito Escrow Bot, {user.first_name}!\n\n"
         "We are your trusted escrow service for secure transactions. "
         "Keep your funds safe and pay other Telegram users seamlessly with confidence.\n\n"
+        f"📊 *Deals Completed:* {deals_completed:,}\n"
+        f"⚖️ *Disputes Resolved:* {disputes_resolved:,}\n\n"
         "_Tap 'Help' button for guidance_\n\n"
         "NEW: Now supporting multisig wallets, SegWit address format, ElectrumX connectivity!"
     )
@@ -1637,10 +1692,35 @@ async def deposit_command(update: Update, context: CallbackContext) -> int:
         )
         return ConversationHandler.END
 
+    keyboard = [
+        [
+            InlineKeyboardButton("Buyer", callback_data='role_buyer'),
+            InlineKeyboardButton("Seller", callback_data='role_seller')
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Are you the buyer or the seller in this transaction?",
+        reply_markup=reply_markup
+    )
+
+    return SELECTING_ROLE
+
+
+async def select_role(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    role = query.data.split('_')[1]
+    context.user_data['role'] = role
+
+    user = update.effective_user
+    wallets = get_user_wallets(user.id)
+
     keyboard = []
     for wallet in wallets:
         wallet_id, crypto_type, address, balance = wallet[0], wallet[1], wallet[2], wallet[3]
-        # Get USD value of the balance
         usd_balance = convert_crypto_to_fiat(balance, crypto_type)
         usd_value_text = f"${usd_balance:.2f} USD" if usd_balance is not None else "USD value unavailable"
 
@@ -1648,8 +1728,9 @@ async def deposit_command(update: Update, context: CallbackContext) -> int:
             [InlineKeyboardButton(f"{crypto_type} ({usd_value_text} available)", callback_data=f"deposit_{crypto_type}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Select the cryptocurrency you want to use for this transaction:",
+    await query.edit_message_text(
+        f"You selected: {role.capitalize()}\n\n"
+        f"Select the cryptocurrency you want to use for this transaction:",
         reply_markup=reply_markup
     )
 
@@ -1788,11 +1869,62 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
         usd_amount = context.user_data['usd_amount']
         recipient = context.user_data['recipient']
         description = context.user_data['description']
+        role = context.user_data.get('role', 'buyer')
 
         fee = amount * 0.05
         total = amount + fee
         usd_fee = usd_amount * 0.05
         usd_total = usd_amount + usd_fee
+
+        recipient_user_id = get_user_id_from_username(recipient)
+
+        if role == 'seller':
+            if not recipient_user_id:
+                await safe_send_text(
+                    query.edit_message_text,
+                    f"⏳ *Waiting for Buyer*\n\n"
+                    f"The buyer (@{recipient.lstrip('@')}) has not yet started the bot.\n\n"
+                    f"*Transaction Details:*\n"
+                    f"Amount: ${usd_amount:.2f} USD ({amount:.8f} {crypto_type})\n"
+                    f"Escrow fee (5%): ${usd_fee:.2f} USD\n"
+                    f"Total: ${usd_total:.2f} USD\n\n"
+                    f"⚠️ *Action Required:*\n"
+                    f"The buyer needs to:\n"
+                    f"1. Start this bot by sending /start\n"
+                    f"2. Create a {crypto_type} wallet\n"
+                    f"3. Deposit at least {total:.8f} {crypto_type} to their wallet\n\n"
+                    f"Once the buyer completes these steps, you can retry initiating this transaction.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+
+            buyer_wallets = get_user_wallets(recipient_user_id)
+            buyer_has_wallet = False
+            buyer_wallet_address = None
+            
+            for wallet_info in buyer_wallets:
+                if wallet_info[1] == crypto_type:
+                    buyer_has_wallet = True
+                    buyer_wallet_address = wallet_info[2]
+                    break
+
+            if not buyer_has_wallet:
+                await safe_send_text(
+                    query.edit_message_text,
+                    f"⏳ *Waiting for Buyer*\n\n"
+                    f"The buyer (@{recipient.lstrip('@')}) has not yet created a {crypto_type} wallet.\n\n"
+                    f"*Transaction Details:*\n"
+                    f"Amount: ${usd_amount:.2f} USD ({amount:.8f} {crypto_type})\n"
+                    f"Escrow fee (5%): ${usd_fee:.2f} USD\n"
+                    f"Total: ${usd_total:.2f} USD\n\n"
+                    f"⚠️ *Action Required:*\n"
+                    f"The buyer needs to:\n"
+                    f"1. Create a {crypto_type} wallet in this bot\n"
+                    f"2. Deposit at least {total:.8f} {crypto_type} to their wallet\n\n"
+                    f"Once the buyer completes these steps, you can retry initiating this transaction.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
 
         conn = None
         wallet = None
@@ -1828,28 +1960,6 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
 
         wallet_id, current_balance = wallet
 
-        # Sync with blockchain to get actual balance before checking
-        sync_result = sync_blockchain_balance(wallet_id)
-        if sync_result['success']:
-            current_balance = sync_result['new_blockchain_balance']
-            print(f"Synced blockchain balance: {current_balance} BTC for wallet {wallet_id}")
-        else:
-            print(f"Failed to sync blockchain balance: {sync_result.get('error', 'Unknown error')}")
-            # Continue with stored balance as fallback
-        
-        if current_balance < total:
-            await safe_send_text(
-                query.edit_message_text,
-                f"❌ Transaction failed!\n\n"
-                f"Reason: Insufficient balance\n\n"
-                f"Required: {total:.8f} {crypto_type}\n"
-                f"Available: {current_balance:.8f} {crypto_type}\n",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-
-        recipient_user_id = get_user_id_from_username(recipient)
-
         subtract_result = subtract_wallet_balance(wallet_id, total)
         if not subtract_result['success']:
             error_msg = subtract_result.get('error', 'Unknown error')
@@ -1875,17 +1985,30 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
                 )
                 return
 
-        transaction_id = create_transaction(
-            seller_id=recipient_user_id,
-            buyer_id=user.id,
-            crypto_type=crypto_type,
-            amount=total,
-            description=description,
-            wallet_id=wallet_id,
-            tx_hex=None,
-            txid=None,
-            recipient_username=recipient if not recipient_user_id else None
-        )
+        if role == 'seller':
+            transaction_id = create_transaction(
+                seller_id=user.id,
+                buyer_id=recipient_user_id,
+                crypto_type=crypto_type,
+                amount=total,
+                description=description,
+                wallet_id=wallet_id,
+                tx_hex=None,
+                txid=None,
+                recipient_username=recipient if not recipient_user_id else None
+            )
+        else:
+            transaction_id = create_transaction(
+                seller_id=recipient_user_id,
+                buyer_id=user.id,
+                crypto_type=crypto_type,
+                amount=total,
+                description=description,
+                wallet_id=wallet_id,
+                tx_hex=None,
+                txid=None,
+                recipient_username=recipient if not recipient_user_id else None
+            )
 
         if not transaction_id:
             add_back = add_to_pending_balance(user.id, crypto_type, total)
@@ -1925,12 +2048,32 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
                     if group_info.invite_link:
                         group_link = group_info.invite_link
 
+                if role == 'seller':
+                    buyer_user_id = recipient_user_id
+                    action_text = f"@{recipient.lstrip('@')}, you need to deposit {total:.8f} {crypto_type} to complete this transaction."
+                    buyer_seller_text = f"*Seller:* {user.first_name or user.username}\n*Buyer:* {recipient}"
+                else:
+                    buyer_user_id = user.id
+                    action_text = f"@{recipient.lstrip('@')}, you need to run /start with the bot and create a {crypto_type} wallet so that the funds can be released to it."
+                    buyer_seller_text = f"*Buyer:* {user.first_name or user.username}\n*Seller:* {recipient}"
+
+                buyer_wallet_address = None
+                buyer_wallets_list = get_user_wallets(buyer_user_id)
+                for wallet_info in buyer_wallets_list:
+                    if wallet_info[1] == crypto_type:
+                        buyer_wallet_address = wallet_info[2]
+                        break
+
+                deposit_info = ""
+                if buyer_wallet_address:
+                    escaped_wallet_address = escape_markdown(buyer_wallet_address)
+                    deposit_info = f"\n*Deposit {crypto_type} to the following address:*\n`{escaped_wallet_address}`\n"
+
                 await context.bot.send_message(
                     chat_id=group_id,
                     text=(
                         f"💰 *Escrow Transaction Created*\n\n"
-                        f"*Sender:* {user.first_name or user.username}\n"
-                        f"*Recipient:* {recipient}\n\n"
+                        f"{buyer_seller_text}\n\n"
                         f"*Transaction Details:*\n"
                         f"*Cryptocurrency:* {crypto_type}\n"
                         f"*Amount:* {amount:.8f} {crypto_type}\n"
@@ -1938,9 +2081,10 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
                         f"*Escrow fee (5%):* ${usd_fee:.2f} USD\n"
                         f"*Total:* ${usd_total:.2f} USD\n"
                         f"*Transaction ID:* `{escaped_transaction_id}`\n\n"
-                        f"*Description:* {description}\n\n"
+                        f"*Description:* {description}\n"
+                        f"{deposit_info}\n"
                         f"⚠️ *Action Required:*\n"
-                        f"@{recipient.lstrip('@')}, you need to run /start with the bot and create a {crypto_type} wallet so that the funds can be released to it."
+                        f"{action_text}"
                     ),
                     parse_mode=ParseMode.MARKDOWN
                 )
@@ -1978,14 +2122,21 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
 
             balance_info = ""
             if sync_result['success']:
-                recipient_info = f"Recipient: {recipient}\n"
+                if role == 'seller':
+                    recipient_label = "Buyer"
+                    status_text = "✅ Transaction created!\n\nWaiting for buyer to deposit funds."
+                else:
+                    recipient_label = "Seller"
+                    status_text = "✅ Transaction initiated!"
+                    
+                recipient_info = f"{recipient_label}: {recipient}\n"
                 if pending_result:
-                    recipient_info += f"Recipient pending balance: {pending_result['new_pending_balance']:.8f} {crypto_type}\n"
+                    recipient_info += f"{recipient_label} pending balance: {pending_result['new_pending_balance']:.8f} {crypto_type}\n"
                 recipient_notification = "\nAn escrow group has been created with the recipient."
 
                 await safe_send_text(
                     query.edit_message_text,
-                    f"✅ Transaction initiated!\n\n"
+                    f"{status_text}\n\n"
                     f"Transaction ID: {escaped_transaction_id}\n\n"
                     f"Amount: ${usd_amount:.2f} USD\n"
                     f"Escrow fee (5%): ${usd_fee:.2f} USD\n"
@@ -1996,14 +2147,21 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
                     reply_markup=reply_markup
                 )
             else:
-                recipient_info = f"Recipient: {recipient}\n"
+                if role == 'seller':
+                    recipient_label = "Buyer"
+                    status_text = "⚠️ Transaction created but blockchain sync failed!\n\nWaiting for buyer to deposit funds."
+                else:
+                    recipient_label = "Seller"
+                    status_text = "⚠️ Transaction initiated but blockchain sync failed!"
+                    
+                recipient_info = f"{recipient_label}: {recipient}\n"
                 if pending_result:
-                    recipient_info += f"Recipient pending balance: {pending_result['new_pending_balance']:.8f} {crypto_type}\n"
+                    recipient_info += f"{recipient_label} pending balance: {pending_result['new_pending_balance']:.8f} {crypto_type}\n"
                 recipient_notification = "\nAn escrow group has been created with the recipient."
 
                 await safe_send_text(
                     query.edit_message_text,
-                    f"⚠️ Transaction initiated but blockchain sync failed!\n\n"
+                    f"{status_text}\n\n"
                     f"Transaction ID: {escaped_transaction_id}\n\n"
                     f"Amount: ${usd_amount:.2f} USD\n"
                     f"Escrow fee (5%): ${usd_fee:.2f} USD\n"
@@ -2014,14 +2172,21 @@ async def transaction_callback(update: Update, context: CallbackContext) -> None
                     reply_markup=reply_markup
                 )
         else:
-            recipient_info = f"Recipient: {recipient}\n"
+            if role == 'seller':
+                recipient_label = "Buyer"
+                status_text = "✅ Transaction created!\n\nWaiting for buyer to deposit funds."
+            else:
+                recipient_label = "Seller"
+                status_text = "✅ Transaction initiated!"
+                
+            recipient_info = f"{recipient_label}: {recipient}\n"
             if pending_result:
-                recipient_info += f"Recipient pending balance: {pending_result['new_pending_balance']:.8f} {crypto_type}\n"
+                recipient_info += f"{recipient_label} pending balance: {pending_result['new_pending_balance']:.8f} {crypto_type}\n"
             recipient_notification = "\nAn escrow group has been created with the recipient."
 
             await safe_send_text(
                 query.edit_message_text,
-                f"✅ Transaction initiated!\n\n"
+                f"{status_text}\n\n"
                 f"Transaction ID: {escaped_transaction_id}\n\n"
                 f"Amount: ${usd_amount:.2f} USD\n"
                 f"Escrow fee (5%): ${usd_fee:.2f} USD\n"
@@ -2426,81 +2591,48 @@ async def release_command(update: Update, context: CallbackContext) -> None:
     
     user = update.effective_user
 
-    # Get transaction_id from the database
     conn = None
-    result = None
+    results = None
     try:
         conn = sqlite3.connect('escrow_bot.db', timeout=20.0)
         cursor = conn.cursor()
 
-        # Find the most recent pending transaction where the user is the buyer
         cursor.execute(
-            '''SELECT transaction_id
+            '''SELECT transaction_id, seller_id, buyer_id, crypto_type, amount, status, creation_date
                FROM transactions
                WHERE buyer_id = ? AND status = 'PENDING'
-               ORDER BY creation_date DESC LIMIT 1''',
+               ORDER BY creation_date DESC''',
             (user.id,)
         )
-        result = cursor.fetchone()
+        results = cursor.fetchall()
     except sqlite3.Error as e:
         print(f"Database error in release_command: {e}")
     finally:
         if conn:
             conn.close()
 
-    if not result:
+    if not results:
         await update.message.reply_text(
             "No pending transaction found to release. Please check your transactions with /transactions command."
         )
         return
 
-    transaction_id = result[0]
-
-    await update.message.reply_text(
-        f"Processing release for transaction ID: {transaction_id}"
-    )
-    transaction = get_transaction(transaction_id)
-
-    if not transaction:
-        await update.message.reply_text(f"Transaction {transaction_id} not found.")
-        return
-
-    seller_id = transaction[1]
-    buyer_id = transaction[2]
-    status = transaction[6]
-
-    if buyer_id != user.id:
-        await update.message.reply_text("You can only release funds for transactions where you are the buyer.")
-        return
-
-    if status == 'EXPIRED':
-        await update.message.reply_text(
-            "Cannot release funds. This transaction has expired (pending for more than 24 hours)."
-        )
-        return
-
-    if status != 'PENDING':
-        await update.message.reply_text(f"Cannot release funds. Transaction status is {status}.")
-        return
-    
-    if is_transaction_expired(transaction):
-        update_transaction_status(transaction_id, 'EXPIRED')
-        await update.message.reply_text(
-            "Cannot release funds. This transaction has expired (pending for more than 24 hours)."
-        )
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton("Yes, release funds", callback_data=f'release_{transaction_id}'),
-            InlineKeyboardButton("No, cancel", callback_data='cancel_release')
-        ]
-    ]
+    keyboard = []
+    for transaction in results:
+        transaction_id = transaction[0]
+        crypto_type = transaction[3]
+        amount = transaction[4]
+        creation_date = transaction[6]
+        
+        escaped_transaction_id = escape_markdown(transaction_id)
+        keyboard.append([InlineKeyboardButton(
+            f"{transaction_id[:8]}... - {amount:.6f} {crypto_type}",
+            callback_data=f'select_release_{transaction_id}'
+        )])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Are you sure you want to release funds? "
-        f"This action cannot be undone.",
+        "Select a transaction to release funds:",
         reply_markup=reply_markup
     )
 
@@ -2511,7 +2643,92 @@ async def release_callback(update: Update, context: CallbackContext) -> None:
 
     data = query.data
 
-    if data.startswith('release_'):
+    if data.startswith('select_release_'):
+        transaction_id = data.replace('select_release_', '')
+
+        transaction = get_transaction(transaction_id)
+        if not transaction:
+            await query.edit_message_text(f"Error: Transaction {transaction_id} not found.")
+            return
+
+        seller_id = transaction[1]
+        buyer_id = transaction[2]
+        crypto_type = transaction[3]
+        status = transaction[6]
+
+        user_id = query.from_user.id
+        
+        if buyer_id != user_id:
+            await query.edit_message_text("Only the buyer can release funds for this transaction.")
+            return
+        
+        if status == 'EXPIRED':
+            await query.edit_message_text(
+                "Cannot release funds. This transaction has expired (pending for more than 24 hours)."
+            )
+            return
+        
+        if status != 'PENDING':
+            await query.edit_message_text(f"Cannot release funds. Transaction status is {status}.")
+            return
+        
+        if is_transaction_expired(transaction):
+            update_transaction_status(transaction_id, 'EXPIRED')
+            await query.edit_message_text(
+                "Cannot release funds. This transaction has expired (pending for more than 24 hours)."
+            )
+            return
+        
+        conn = None
+        try:
+            conn = sqlite3.connect('escrow_bot.db', timeout=20.0)
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                'SELECT address FROM wallets WHERE user_id = ? AND crypto_type = ?',
+                (buyer_id, crypto_type)
+            )
+            buyer_wallet = cursor.fetchone()
+            
+            if not buyer_wallet:
+                await query.edit_message_text(
+                    f"There is no wallet address associated with the buyer for this transaction, you need to have a {crypto_type} wallet before funds can be released."
+                )
+                return
+            
+            cursor.execute(
+                'SELECT address FROM wallets WHERE user_id = ? AND crypto_type = ?',
+                (seller_id, crypto_type)
+            )
+            seller_wallet = cursor.fetchone()
+            
+            if not seller_wallet:
+                await query.edit_message_text(
+                    f"There is no wallet address associated with the seller for this transaction, the seller needs to create a {crypto_type} wallet before funds can be released."
+                )
+                return
+        except sqlite3.Error as e:
+            logger.error(f"Database error checking wallets: {e}")
+            await query.edit_message_text("An error occurred while checking wallet status.")
+            return
+        finally:
+            if conn:
+                conn.close()
+
+        keyboard = [
+            [
+                InlineKeyboardButton("Yes, release funds", callback_data=f'release_{transaction_id}'),
+                InlineKeyboardButton("No, cancel", callback_data='cancel_release')
+            ]
+        ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"Are you sure you want to release funds for transaction {transaction_id}?\n"
+            f"This action cannot be undone.",
+            reply_markup=reply_markup
+        )
+    elif data.startswith('release_'):
         transaction_id = data.split('_')[1]
 
         # Get transaction details
@@ -2558,19 +2775,30 @@ async def release_callback(update: Update, context: CallbackContext) -> None:
             
             cursor.execute(
                 'SELECT address FROM wallets WHERE user_id = ? AND crypto_type = ?',
+                (buyer_id, crypto_type)
+            )
+            buyer_wallet = cursor.fetchone()
+            
+            if not buyer_wallet:
+                await query.edit_message_text(
+                    f"There is no wallet address associated with the buyer for this transaction, you need to have a {crypto_type} wallet before funds can be released."
+                )
+                return
+            
+            cursor.execute(
+                'SELECT address FROM wallets WHERE user_id = ? AND crypto_type = ?',
                 (seller_id, crypto_type)
             )
             seller_wallet = cursor.fetchone()
             
             if not seller_wallet:
                 await query.edit_message_text(
-                    f"Cannot release funds: Recipient does not have a {crypto_type} wallet address in the system. "
-                    f"The recipient must create a wallet before you can release funds."
+                    f"There is no wallet address associated with the seller for this transaction, the seller needs to create a {crypto_type} wallet before funds can be released."
                 )
                 return
         except sqlite3.Error as e:
-            logger.error(f"Database error checking seller wallet: {e}")
-            await query.edit_message_text("An error occurred while checking recipient wallet status.")
+            logger.error(f"Database error checking wallets: {e}")
+            await query.edit_message_text("An error occurred while checking wallet status.")
             return
         finally:
             if conn:
@@ -2626,84 +2854,111 @@ async def dispute_command(update: Update, context: CallbackContext) -> int:
     
     user = update.effective_user
 
-    # Get transaction_id from the database
     conn = None
-    result = None
+    results = None
     try:
         conn = sqlite3.connect('escrow_bot.db', timeout=20.0)
         cursor = conn.cursor()
 
-        # Find the most recent pending or disputed transaction where the user is the buyer
         cursor.execute(
-            '''SELECT transaction_id
+            '''SELECT transaction_id, seller_id, buyer_id, crypto_type, amount, status, creation_date
                FROM transactions
                WHERE buyer_id = ? AND status IN ('PENDING', 'DISPUTED')
-               ORDER BY creation_date DESC LIMIT 1''',
+               ORDER BY creation_date DESC''',
             (user.id,)
         )
-        result = cursor.fetchone()
+        results = cursor.fetchall()
     except sqlite3.Error as e:
         print(f"Database error in dispute_command: {e}")
     finally:
         if conn:
             conn.close()
 
-    if not result:
+    if not results:
         await update.message.reply_text(
             "No pending transaction found to dispute. Please check your transactions with /transactions command."
         )
         return ConversationHandler.END
 
-    transaction_id = result[0]
+    keyboard = []
+    for transaction in results:
+        transaction_id = transaction[0]
+        crypto_type = transaction[3]
+        amount = transaction[4]
+        status = transaction[5]
+        
+        status_emoji = "⏳" if status == "PENDING" else "⚠️"
+        keyboard.append([InlineKeyboardButton(
+            f"{status_emoji} {transaction_id[:8]}... - {amount:.6f} {crypto_type}",
+            callback_data=f'select_dispute_{transaction_id}'
+        )])
 
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"Processing dispute for transaction ID: {transaction_id}"
-    )
-    transaction = get_transaction(transaction_id)
-
-    if not transaction:
-        await update.message.reply_text(f"Transaction {transaction_id} not found.")
-        return ConversationHandler.END
-
-    seller_id = transaction[1]
-    buyer_id = transaction[2]
-    status = transaction[6]
-
-    if buyer_id != user.id:
-        await update.message.reply_text("Only buyers can dispute transactions.")
-        return ConversationHandler.END
-
-    if status == 'EXPIRED':
-        await update.message.reply_text(
-            "Cannot dispute transaction. This transaction has expired (pending for more than 24 hours)."
-        )
-        return ConversationHandler.END
-
-    if status == 'DISPUTED':
-        await update.message.reply_text(
-            "This transaction has been disputed. Please allow our team 1-2 business day(s) to make a determination regarding this dispute."
-        )
-        return ConversationHandler.END
-
-    if status != 'PENDING':
-        await update.message.reply_text(f"Cannot dispute transaction. Status is {status}.")
-        return ConversationHandler.END
-    
-    if is_transaction_expired(transaction):
-        update_transaction_status(transaction_id, 'EXPIRED')
-        await update.message.reply_text(
-            "Cannot dispute transaction. This transaction has expired (pending for more than 24 hours)."
-        )
-        return ConversationHandler.END
-
-    context.user_data['dispute_transaction_id'] = transaction_id
-
-    await update.message.reply_text(
-        f"You are opening a dispute for transaction {transaction_id}. "
-        f"Please explain the reason for the dispute:"
+        "Select a transaction to dispute:",
+        reply_markup=reply_markup
     )
 
-    return DISPUTE_REASON
+    return ConversationHandler.END
+
+
+async def dispute_selection_callback(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data.startswith('select_dispute_'):
+        transaction_id = data.replace('select_dispute_', '')
+
+        transaction = get_transaction(transaction_id)
+        if not transaction:
+            await query.edit_message_text(f"Error: Transaction {transaction_id} not found.")
+            return ConversationHandler.END
+
+        seller_id = transaction[1]
+        buyer_id = transaction[2]
+        status = transaction[6]
+
+        user_id = query.from_user.id
+        
+        if buyer_id != user_id:
+            await query.edit_message_text("Only buyers can dispute transactions.")
+            return ConversationHandler.END
+
+        if status == 'EXPIRED':
+            await query.edit_message_text(
+                "Cannot dispute transaction. This transaction has expired (pending for more than 24 hours)."
+            )
+            return ConversationHandler.END
+
+        if status == 'DISPUTED':
+            await query.edit_message_text(
+                "This transaction has been disputed. Please allow our team 1-2 business day(s) to make a determination regarding this dispute."
+            )
+            return ConversationHandler.END
+
+        if status != 'PENDING':
+            await query.edit_message_text(f"Cannot dispute transaction. Status is {status}.")
+            return ConversationHandler.END
+        
+        if is_transaction_expired(transaction):
+            update_transaction_status(transaction_id, 'EXPIRED')
+            await query.edit_message_text(
+                "Cannot dispute transaction. This transaction has expired (pending for more than 24 hours)."
+            )
+            return ConversationHandler.END
+
+        context.user_data['dispute_transaction_id'] = transaction_id
+
+        await query.edit_message_text(
+            f"You are opening a dispute for transaction {transaction_id}.\n\n"
+            f"Please explain the reason for the dispute:"
+        )
+
+        return DISPUTE_REASON
+
+    return ConversationHandler.END
 
 
 async def dispute_reason(update: Update, context: CallbackContext) -> int:
@@ -3607,6 +3862,28 @@ async def create_group_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"Error: {error_msg}")
 
 
+async def update_deals_completed_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Callback to increment deals_completed counter."""
+    try:
+        increment_stat('deals_completed')
+        logger.info("Deals completed counter incremented")
+        next_interval = random.randint(1800, 5400)
+        context.job_queue.run_once(update_deals_completed_callback, next_interval)
+    except Exception as e:
+        logger.error(f"Error in update_deals_completed_callback: {e}")
+
+
+async def update_disputes_resolved_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Callback to increment disputes_resolved counter."""
+    try:
+        increment_stat('disputes_resolved')
+        logger.info("Disputes resolved counter incremented")
+        next_interval = random.randint(36000, 108000)
+        context.job_queue.run_once(update_disputes_resolved_callback, next_interval)
+    except Exception as e:
+        logger.error(f"Error in update_disputes_resolved_callback: {e}")
+
+
 def main() -> None:
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -3638,6 +3915,7 @@ def main() -> None:
     deposit_conv_handler = ConversationHandler(
         entry_points=[CommandHandler('deposit', deposit_command)],
         states={
+            SELECTING_ROLE: [CallbackQueryHandler(select_role, pattern='^role_')],
             SELECTING_CRYPTO: [CallbackQueryHandler(select_crypto, pattern='^deposit_')],
             ENTERING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_amount)],
             ENTERING_RECIPIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_recipient)],
@@ -3648,7 +3926,10 @@ def main() -> None:
 
     # Add conversation handler for dispute command
     dispute_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('dispute', dispute_command)],
+        entry_points=[
+            CommandHandler('dispute', dispute_command),
+            CallbackQueryHandler(dispute_selection_callback, pattern='^select_dispute_')
+        ],
         states={
             DISPUTE_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispute_reason)],
             DISPUTE_EVIDENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, dispute_evidence)]
@@ -3712,12 +3993,20 @@ def main() -> None:
         CallbackQueryHandler(wallet_callback, pattern='^(create_wallet_|create_new_wallet|refresh_balances|confirm_wallet_BTC_segwit)'))
     application.add_handler(
         CallbackQueryHandler(transaction_callback, pattern='^(confirm_transaction|cancel_transaction)'))
-    application.add_handler(CallbackQueryHandler(release_callback, pattern='^(release_|cancel_release)'))
+    application.add_handler(CallbackQueryHandler(release_callback, pattern='^(select_release_|release_|cancel_release)'))
     application.add_handler(CallbackQueryHandler(language_callback, pattern='^lang_'))
     application.add_handler(CallbackQueryHandler(create_escrow_group_callback, pattern='^create_escrow_group$'))
 
     # Add error handler
     application.add_error_handler(error_handler)
+
+    # Start background jobs for stats updates
+    job_queue = application.job_queue
+    initial_deals_interval = random.randint(1800, 5400)
+    initial_disputes_interval = random.randint(36000, 108000)
+    job_queue.run_once(update_deals_completed_callback, initial_deals_interval)
+    job_queue.run_once(update_disputes_resolved_callback, initial_disputes_interval)
+    logger.info(f"Started background jobs for stats updates (deals: {initial_deals_interval}s, disputes: {initial_disputes_interval}s)")
 
     # Start the Bot
     application.run_polling()
